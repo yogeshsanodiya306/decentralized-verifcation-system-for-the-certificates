@@ -1,0 +1,21 @@
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import { ethers } from 'ethers';
+const app=express(), port=Number(process.env.PORT||4000), uploadDir=path.resolve('uploads');
+fs.mkdirSync(uploadDir,{recursive:true});
+const upload=multer({dest:uploadDir,limits:{fileSize:Number(process.env.MAX_UPLOAD_MB||10)*1024*1024}});
+app.use(cors()); app.use(express.json()); app.use(express.static('public'));
+const abi=['function registerCertificate(bytes32,bytes32,string,uint64)','function verifyCertificate(bytes32,bytes32) view returns(bool,address,uint256,uint256,bool)','function revokeCertificate(bytes32)'];
+let contract,issuer; const demo=new Map();
+if(process.env.RPC_URL&&process.env.ISSUER_PRIVATE_KEY&&process.env.CONTRACT_ADDRESS){const provider=new ethers.JsonRpcProvider(process.env.RPC_URL);issuer=new ethers.Wallet(process.env.ISSUER_PRIVATE_KEY,provider);contract=new ethers.Contract(process.env.CONTRACT_ADDRESS,abi,issuer);}
+const hash=p=>crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'); const idHash=id=>ethers.keccak256(ethers.toUtf8Bytes(id)); const clean=f=>f&&fs.rm(f.path,{force:true},()=>{});
+app.get('/api/health',(_q,r)=>r.json({ok:true,mode:contract?'blockchain':'demo'}));
+app.post('/api/certificates',upload.single('document'),async(req,res)=>{if(!req.file)return res.status(400).json({error:'Document is required'});try{const id=req.body.certificateId?.trim()||`CERT-${crypto.randomUUID().slice(0,8).toUpperCase()}`,h=hash(req.file.path),exp=req.body.expiresAt?Math.floor(new Date(req.body.expiresAt).getTime()/1000):0;let tx=null,who='demo-issuer';if(contract){const t=await contract.registerCertificate(idHash(id),`0x${h}`,req.body.metadataUri||'',exp);await t.wait();tx=t.hash;who=issuer.address;}else demo.set(id,{id,hash:h,issuer:who,issuedAt:Math.floor(Date.now()/1000),expiresAt:exp,revoked:false});clean(req.file);res.status(201).json({id,hash:h,issuer:who,transactionHash:tx,mode:contract?'blockchain':'demo'});}catch(e){clean(req.file);res.status(500).json({error:e.shortMessage||e.message});}});
+app.post('/api/verify',upload.single('document'),async(req,res)=>{if(!req.file||!req.body.certificateId)return res.status(400).json({error:'Certificate ID and document are required'});try{const id=req.body.certificateId.trim(),h=hash(req.file.path);let out;if(contract){const v=await contract.verifyCertificate(idHash(id),`0x${h}`);out={valid:v[0],issuer:v[1],issuedAt:Number(v[2]),expiresAt:Number(v[3]),revoked:v[4]};}else{const c=demo.get(id);out=c?{...c,valid:c.hash===h&&!c.revoked&&(!c.expiresAt||c.expiresAt>=Date.now()/1000)}:{valid:false,reason:'Certificate not found'};}clean(req.file);res.json({...out,hash:h,mode:contract?'blockchain':'demo'});}catch(e){clean(req.file);res.status(500).json({error:e.shortMessage||e.message});}});
+app.post('/api/certificates/:id/revoke',async(req,res)=>{try{if(contract){const t=await contract.revokeCertificate(idHash(req.params.id));await t.wait();return res.json({revoked:true,transactionHash:t.hash});}const c=demo.get(req.params.id);if(!c)return res.status(404).json({error:'Not found'});c.revoked=true;res.json({revoked:true});}catch(e){res.status(500).json({error:e.shortMessage||e.message});}});
+app.get('*',(_q,r)=>r.sendFile(path.resolve('public/index.html')));app.listen(port,()=>console.log(`Running at http://localhost:${port}`));
